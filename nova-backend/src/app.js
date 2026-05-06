@@ -11,10 +11,12 @@ const authRoutes    = require('./routes/auth');
 const productRoutes = require('./routes/products');
 const cartRoutes    = require('./routes/cart');
 const orderRoutes   = require('./routes/orders');
+const { query, pool } = require('./config/database');
 const { errorHandler, notFound } = require('./middlewares/errorHandler');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+const ENV_NAME = process.env.NODE_ENV || 'development';
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean);
@@ -22,7 +24,7 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boo
 app.use(cors({
   origin: (origin, cb) => {
     // Permite cualquier origen en desarrollo, o los configurados en producción
-    if (!origin || process.env.NODE_ENV === 'development' || allowedOrigins.includes(origin)) {
+    if (!origin || ENV_NAME === 'development' || allowedOrigins.includes(origin)) {
       cb(null, true);
     } else {
       cb(new Error(`Origen no permitido por CORS: ${origin}`));
@@ -45,12 +47,21 @@ app.use((req, _res, next) => {
 });
 
 // ── HEALTH CHECK ──────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => {
+app.get('/health', async (_req, res) => {
+  let db = 'disconnected';
+  try {
+    await query('SELECT 1');
+    db = 'connected';
+  } catch (_err) {
+    db = 'error';
+  }
+
   res.json({
-    status:    'ok',
-    service:   'NOVA API',
-    version:   '1.0.0',
-    env:       process.env.NODE_ENV,
+    status: 'ok',
+    service: 'NOVA API',
+    version: '1.0.0',
+    env: ENV_NAME,
+    db,
     timestamp: new Date().toISOString(),
   });
 });
@@ -99,16 +110,23 @@ app.use(notFound);
 app.use(errorHandler);
 
 // ── INICIO ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log('');
   console.log('  ╔══════════════════════════════════════╗');
   console.log(`  ║   NOVA API  →  http://localhost:${PORT}   ║`);
-  console.log(`  ║   Entorno: ${process.env.NODE_ENV.padEnd(26)}║`);
+  console.log(`  ║   Entorno: ${ENV_NAME.padEnd(26)}║`);
   console.log('  ╚══════════════════════════════════════╝');
   console.log('');
   console.log('  Endpoints disponibles en GET /api');
   console.log('  Health check en GET /health');
   console.log('');
+});
+
+process.on('SIGINT', async () => {
+  server.close(async () => {
+    await pool.end();
+    process.exit(0);
+  });
 });
 
 module.exports = app;
