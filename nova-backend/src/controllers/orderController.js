@@ -5,10 +5,9 @@
 //  GET  /api/orders/:orderId
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { v4: uuidv4 }           = require('uuid');
-const { Carts, Orders }        = require('../config/database');
-const { findById: findProduct } = require('../config/products');
-const { processPayment }        = require('../utils/paymentService');
+const { v4: uuidv4 } = require('uuid');
+const { Carts, getClient, query } = require('../config/database');
+const { processPayment } = require('../utils/paymentService');
 
 // ── POST /api/checkout ────────────────────────────────────────────────────────
 // Body: { paymentMethod: 'card'|'transfer'|'crypto', holderName: 'Juan Pérez' }
@@ -17,38 +16,61 @@ const checkout = async (req, res, next) => {
     const { paymentMethod = 'card', holderName } = req.body;
 
     // 1. Obtener carrito
-    const cart = Carts.findByUserId(req.user.id);
-    if (!cart || cart.items.length === 0) {
+    const cart = await Carts.findByUserId(req.user.id);
+    if (!cart) {
       return res.status(400).json({ success: false, error: 'El carrito está vacío.' });
+    }
+
+    const cartCountResult = await query(
+      'SELECT COUNT(*)::int AS total FROM cart_items WHERE cart_id = $1',
+      [cart.id],
+    );
+    const totalCartItems = cartCountResult.rows[0]?.total || 0;
+    if (totalCartItems === 0) {
+      return res.status(400).json({ success: false, error: 'El carrito está vacío.' });
+    }
+
+    const cartItemsResult = await query(
+      `SELECT
+         ci.product_id AS "productId",
+         ci.qty,
+         p.name,
+         p.emoji,
+         p.price,
+         p.stock
+       FROM cart_items ci
+       INNER JOIN products p ON p.id = ci.product_id
+       WHERE ci.cart_id = $1`,
+      [cart.id],
+    );
+    const cartItems = cartItemsResult.rows;
+    if (cartItems.length !== totalCartItems) {
+      return res.status(400).json({
+        success: false,
+        error: 'Hay productos no disponibles en el carrito. Revísalo e intenta de nuevo.',
+      });
     }
 
     // 2. Validar stock y calcular total
     const orderItems = [];
     let total = 0;
 
-    for (const cartItem of cart.items) {
-      const product = findProduct(cartItem.productId);
-      if (!product) {
+    for (const cartItem of cartItems) {
+      if (cartItem.stock < cartItem.qty) {
         return res.status(400).json({
           success: false,
-          error: `Producto con id "${cartItem.productId}" ya no está disponible.`,
-        });
-      }
-      if (product.stock < cartItem.qty) {
-        return res.status(400).json({
-          success: false,
-          error: `Stock insuficiente para "${product.name}". Disponibles: ${product.stock}.`,
+          error: `Stock insuficiente para "${cartItem.name}". Disponibles: ${cartItem.stock}.`,
         });
       }
 
-      const subtotal = product.price * cartItem.qty;
+      const subtotal = Number(cartItem.price) * cartItem.qty;
       total += subtotal;
 
       orderItems.push({
-        productId: product.id,
-        name:      product.name,
-        emoji:     product.emoji,
-        price:     product.price,
+        productId: cartItem.productId,
+        name:      cartItem.name,
+        emoji:     cartItem.emoji,
+        price:     Number(cartItem.price),
         qty:       cartItem.qty,
         subtotal,
       });
@@ -71,37 +93,67 @@ const checkout = async (req, res, next) => {
     }
 
     // 4. Crear orden
-    const order = Orders.create({
-      id:            `ORD-${uuidv4().split('-')[0].toUpperCase()}`,
-      userId:        req.user.id,
-      items:         orderItems,
-      total,
-      paymentMethod,
-      holderName:    holderName || req.user.username,
-      transactionId: paymentResult.transactionId,
-      status:        'confirmed',
-      createdAt:     new Date().toISOString(),
-    });
+    const client = await getClient();
+    const orderId = `ORD-${uuidv4().split('-')[0].toUpperCase()}`;
+    const createdAt = new Date().toISOString();
+    try {
+      await client.query('BEGIN');
 
-    // 5. Vaciar carrito
-    cart.items     = [];
-    cart.updatedAt = new Date().toISOString();
-    const { Carts: CartsDb } = require('../config/database');
-    CartsDb.save(cart);
+      await client.query(
+        `INSERT INTO orders
+           (id, user_id, total, payment_method, holder_name, transaction_id, status, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          orderId,
+          req.user.id,
+          total,
+          paymentMethod,
+          holderName || req.user.username,
+          paymentResult.transactionId,
+          'confirmed',
+          createdAt,
+        ],
+      );
 
-    console.log(`[CHECKOUT] Orden ${order.id} confirmada. TXN: ${paymentResult.transactionId}`);
+      for (const item of orderItems) {
+        await client.query(
+          `INSERT INTO order_items
+             (order_id, product_id, name, emoji, price, qty, subtotal)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [orderId, item.productId, item.name, item.emoji, item.price, item.qty, item.subtotal],
+        );
+        const stockUpdate = await client.query(
+          'UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1',
+          [item.qty, item.productId],
+        );
+        if (stockUpdate.rowCount === 0) {
+          throw new Error(`Stock insuficiente para ${item.name}.`);
+        }
+      }
+
+      await client.query('DELETE FROM cart_items WHERE cart_id = $1', [cart.id]);
+      await client.query('UPDATE carts SET updated_at = $1 WHERE id = $2', [new Date().toISOString(), cart.id]);
+      await client.query('COMMIT');
+    } catch (dbError) {
+      await client.query('ROLLBACK');
+      throw dbError;
+    } finally {
+      client.release();
+    }
+
+    console.log(`[CHECKOUT] Orden ${orderId} confirmada. TXN: ${paymentResult.transactionId}`);
 
     res.status(201).json({
       success: true,
       message: 'Pago procesado y orden confirmada.',
       data: {
         order: {
-          id:            order.id,
-          total:         order.total,
-          status:        order.status,
-          transactionId: order.transactionId,
-          items:         order.items,
-          createdAt:     order.createdAt,
+          id: orderId,
+          total,
+          status: 'confirmed',
+          transactionId: paymentResult.transactionId,
+          items: orderItems,
+          createdAt,
         },
       },
     });
@@ -111,39 +163,82 @@ const checkout = async (req, res, next) => {
 };
 
 // ── GET /api/orders ───────────────────────────────────────────────────────────
-const getOrders = (req, res) => {
-  const orders = Orders.findByUserId(req.user.id)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+const getOrders = async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT
+         o.id,
+         o.total,
+         o.status,
+         o.payment_method AS "paymentMethod",
+         o.created_at AS "createdAt",
+         COALESCE(SUM(oi.qty), 0)::int AS "itemCount"
+       FROM orders o
+       LEFT JOIN order_items oi ON oi.order_id = o.id
+       WHERE o.user_id = $1
+       GROUP BY o.id
+       ORDER BY o.created_at DESC`,
+      [req.user.id],
+    );
 
-  res.json({
-    success: true,
-    data: {
-      total: orders.length,
-      orders: orders.map(o => ({
-        id:            o.id,
-        total:         o.total,
-        status:        o.status,
-        paymentMethod: o.paymentMethod,
-        itemCount:     o.items.reduce((s, i) => s + i.qty, 0),
-        createdAt:     o.createdAt,
-      })),
-    },
-  });
+    res.json({
+      success: true,
+      data: {
+        total: result.rows.length,
+        orders: result.rows,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
 };
 
 // ── GET /api/orders/:orderId ──────────────────────────────────────────────────
-const getOrderById = (req, res) => {
-  const order = Orders.findById(req.params.orderId);
+const getOrderById = async (req, res, next) => {
+  try {
+    const orderResult = await query(
+      `SELECT
+         id,
+         user_id AS "userId",
+         total,
+         payment_method AS "paymentMethod",
+         holder_name AS "holderName",
+         transaction_id AS "transactionId",
+         status,
+         created_at AS "createdAt"
+       FROM orders
+       WHERE id = $1`,
+      [req.params.orderId],
+    );
+    const order = orderResult.rows[0];
+    if (!order) {
+      return res.status(404).json({ success: false, error: 'Orden no encontrada.' });
+    }
+    if (order.userId !== req.user.id) {
+      return res.status(403).json({ success: false, error: 'Acceso denegado.' });
+    }
 
-  if (!order) {
-    return res.status(404).json({ success: false, error: 'Orden no encontrada.' });
-  }
-  // El usuario solo puede ver sus propias órdenes
-  if (order.userId !== req.user.id) {
-    return res.status(403).json({ success: false, error: 'Acceso denegado.' });
-  }
+    const itemsResult = await query(
+      `SELECT
+         product_id AS "productId",
+         name,
+         emoji,
+         price,
+         qty,
+         subtotal
+       FROM order_items
+       WHERE order_id = $1
+       ORDER BY id ASC`,
+      [order.id],
+    );
 
-  res.json({ success: true, data: { order } });
+    res.json({
+      success: true,
+      data: { order: { ...order, items: itemsResult.rows } },
+    });
+  } catch (err) {
+    next(err);
+  }
 };
 
 module.exports = { checkout, getOrders, getOrderById };

@@ -4,30 +4,65 @@
 //  GET /api/products/:id
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { findAll, findById } = require('../config/products');
+const { query } = require('../config/database');
 
 // ── GET /api/products ─────────────────────────────────────────────────────────
 // Query params opcionales: ?category=tech&search=teclado
-const getProducts = (req, res) => {
-  const { category, search } = req.query;
-  const list = findAll({ category, search });
+const getProducts = async (req, res, next) => {
+  try {
+    const { category, search } = req.query;
+    const filters = [];
+    const params = [];
 
-  res.json({
-    success: true,
-    data: {
-      total:    list.length,
-      products: list,
-    },
-  });
+    if (category) {
+      params.push(category);
+      filters.push(`category = $${params.length}`);
+    }
+    if (search) {
+      params.push(`%${search}%`);
+      filters.push(`name ILIKE $${params.length}`);
+    }
+
+    const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const result = await query(
+      `SELECT id, name, category, emoji, description, price, stock
+       FROM products
+       ${whereClause}
+       ORDER BY created_at ASC, id ASC`,
+      params,
+    );
+
+    res.json({
+      success: true,
+      data: {
+        total: result.rows.length,
+        products: result.rows,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
 };
 
 // ── GET /api/products/:id ─────────────────────────────────────────────────────
-const getProductById = (req, res) => {
-  const product = findById(req.params.id);
-  if (!product) {
-    return res.status(404).json({ success: false, error: 'Producto no encontrado.' });
+const getProductById = async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT id, name, category, emoji, description, price, stock
+       FROM products
+       WHERE id = $1`,
+      [req.params.id],
+    );
+
+    const product = result.rows[0];
+    if (!product) {
+      return res.status(404).json({ success: false, error: 'Producto no encontrado.' });
+    }
+
+    res.json({ success: true, data: { product } });
+  } catch (err) {
+    next(err);
   }
-  res.json({ success: true, data: { product } });
 };
 
 module.exports = { getProducts, getProductById };

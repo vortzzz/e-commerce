@@ -21,35 +21,35 @@ const signToken = (userId) =>
 const register = async (req, res, next) => {
   try {
     const { username, email, password } = req.body;
+    const normalizedEmail = email.toLowerCase();
 
-    if (Users.findByEmail(email)) {
+    if (await Users.findByEmail(normalizedEmail)) {
       return res.status(409).json({ success: false, error: 'El correo ya está registrado.' });
     }
-    if (Users.findByUsername(username)) {
+    if (await Users.findByUsername(username)) {
       return res.status(409).json({ success: false, error: 'El nombre de usuario ya está en uso.' });
     }
 
     const rounds       = parseInt(process.env.BCRYPT_ROUNDS) || 10;
     const passwordHash = await bcrypt.hash(password, rounds);
 
-    const user = Users.create({
+    const savedUser = await Users.create({
       id: uuidv4(),
       username,
-      email: email.toLowerCase(),
+      email: normalizedEmail,
       passwordHash,
       createdAt: new Date().toISOString(),
     });
+    const token = signToken(savedUser.id);
 
-    const token = signToken(user.id);
-
-    console.log(`[AUTH] Nuevo registro: ${user.username} (${user.email})`);
+    console.log(`[AUTH] Nuevo registro: ${savedUser.username} (${savedUser.email})`);
 
     res.status(201).json({
       success: true,
       message: 'Usuario registrado exitosamente.',
       data: {
         token,
-        user: { id: user.id, username: user.username, email: user.email },
+        user: { id: savedUser.id, username: savedUser.username, email: savedUser.email },
       },
     });
   } catch (err) {
@@ -63,7 +63,7 @@ const login = async (req, res, next) => {
     const { username, password } = req.body;
 
     // Acepta login por username o email
-    const user = Users.findByUsername(username) || Users.findByEmail(username);
+    const user = await Users.findByUsername(username) || await Users.findByEmail(username);
     if (!user) {
       return res.status(401).json({ success: false, error: 'Credenciales inválidas.' });
     }
@@ -99,19 +99,26 @@ const logout = (req, res) => {
 };
 
 // ── GET /api/auth/me ──────────────────────────────────────────────────────────
-const me = (req, res) => {
-  const user = Users.findById(req.user.id);
-  res.json({
-    success: true,
-    data: {
-      user: {
-        id:        user.id,
-        username:  user.username,
-        email:     user.email,
-        createdAt: user.createdAt,
+const me = async (req, res, next) => {
+  try {
+    const user = await Users.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'Usuario no encontrado.' });
+    }
+    res.json({
+      success: true,
+      data: {
+        user: {
+          id:        user.id,
+          username:  user.username,
+          email:     user.email,
+          createdAt: user.createdAt,
+        },
       },
-    },
-  });
+    });
+  } catch (err) {
+    next(err);
+  }
 };
 
 module.exports = { register, login, logout, me };

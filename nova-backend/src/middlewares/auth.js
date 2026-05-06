@@ -9,7 +9,7 @@ const { Users } = require('../config/database');
 /**
  * Middleware: requiere token válido. Adjunta req.user = { id, username, email }
  */
-const requireAuth = (req, res, next) => {
+const requireAuth = async (req, res, next) => {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -23,7 +23,7 @@ const requireAuth = (req, res, next) => {
 
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
-    const user = Users.findById(payload.sub);
+    const user = await Users.findById(payload.sub);
     if (!user) {
       return res.status(401).json({ success: false, error: 'Usuario no encontrado.' });
     }
@@ -38,13 +38,13 @@ const requireAuth = (req, res, next) => {
 /**
  * Middleware opcional: si hay token lo procesa, si no, continúa sin usuario.
  */
-const optionalAuth = (req, res, next) => {
+const optionalAuth = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) return next();
   try {
     const token = authHeader.split(' ')[1];
     const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = Users.findById(payload.sub);
+    req.user = await Users.findById(payload.sub);
   } catch (_) { /* continúa sin usuario */ }
   next();
 };
